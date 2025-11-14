@@ -23,7 +23,7 @@ ICON_MULTIPLIERS = {
 # Column indices (0-based) for the Oanda-Screener sheet
 COL_PAIR = 0        # A – Pair
 COL_PRICE = 1       # B – Price
-COL_PCT_DOWN = 2    # C – % down from ATH
+COL_PCT_DOWN = 2    # C – % down from ATH (stored as negative when below ATH)
 COL_LONG_MA = 10    # K – Long MA
 COL_ICON = 18       # S – Icon
 COL_SENTIMENT = 20  # U – Sentiment
@@ -39,19 +39,28 @@ DEFAULT_WORKSHEET_NAME = "Oanda-Screener"
 # ---------------------------------------------------------------------
 
 
-def get_bracket_pct(pct_down: float) -> Optional[float]:
+def get_bracket_pct(pct_from_ath: float) -> Optional[float]:
     """
     Bracket order size by % down from ATH.
 
-    0–6% down → 5% of buying power
-    7–12%     → 10% of buying power
-    13–18%    → 15% of buying power
-    19%+      → 20% of buying power
+    Sheet convention:
+      - Negative values = below ATH (e.g. -10 means 10% down from ATH)
+      - Positive values = above ATH (invalid for this strategy)
 
-    Anything negative is treated as invalid and returns None.
+    0–6% down  -> 5% of buying power
+    7–12%      -> 10% of buying power
+    13–18%     -> 15% of buying power
+    19%+       -> 20% of buying power
+
+    Anything above ATH (pct_from_ath > 0) is treated as invalid and returns None.
     """
-    if pct_down < 0:
+
+    # If we're above ATH, skip this row
+    if pct_from_ath > 0:
         return None
+
+    # Use the magnitude of the drop from ATH
+    pct_down = abs(pct_from_ath)
 
     if 0 <= pct_down <= 6:
         return 0.05
@@ -62,7 +71,6 @@ def get_bracket_pct(pct_down: float) -> Optional[float]:
     if pct_down > 18:
         return 0.20
 
-    # In case of weird boundaries
     return None
 
 
@@ -246,10 +254,11 @@ def choose_order_from_rows(rows, buying_power: float):
     - Only consider rows where:
         * icon in ICON_MULTIPLIERS
         * sentiment == 🟢
-    - % down from ATH (C) controls base allocation bracket.
+    - % from ATH (C) is expected negative when below ATH:
+        * we use its absolute value as "% down" to control bracket.
     - Icon multiplier scales inside the bracket.
     - Long MA vs price factor = long_ma / price
-    - Anything with pct_down < 0 is skipped.
+    - Anything with pct_from_ath > 0 (above ATH) is skipped.
     - If notional < 1.0, skip.
     - Returns first valid (pair, price, notional) encountered.
     """
@@ -262,7 +271,7 @@ def choose_order_from_rows(rows, buying_power: float):
 
         pair = row[COL_PAIR].strip()
         price_str = row[COL_PRICE]
-        pct_down_str = row[COL_PCT_DOWN]
+        pct_from_ath_str = row[COL_PCT_DOWN]
         long_ma_str = row[COL_LONG_MA]
         icon = row[COL_ICON].strip()
         sentiment = row[COL_SENTIMENT].strip()
@@ -282,7 +291,7 @@ def choose_order_from_rows(rows, buying_power: float):
             continue
 
         price = parse_float(price_str)
-        pct_down = parse_float(pct_down_str)
+        pct_from_ath = parse_float(pct_from_ath_str)
         long_ma = parse_float(long_ma_str)
 
         if price is None or price <= 0:
@@ -295,15 +304,17 @@ def choose_order_from_rows(rows, buying_power: float):
                           idx, pair, long_ma_str)
             continue
 
-        if pct_down is None:
-            logging.debug("Row %s %s: invalid pct_down '%s', skipping.",
-                          idx, pair, pct_down_str)
+        if pct_from_ath is None:
+            logging.debug("Row %s %s: invalid pct_from_ath '%s', skipping.",
+                          idx, pair, pct_from_ath_str)
             continue
 
-        bracket_pct = get_bracket_pct(pct_down)
+        bracket_pct = get_bracket_pct(pct_from_ath)
         if bracket_pct is None:
-            logging.debug("Row %s %s: pct_down %s outside valid brackets, skipping.",
-                          idx, pair, pct_down)
+            logging.debug(
+                "Row %s %s: pct_from_ath %s outside valid brackets (likely above ATH), skipping.",
+                idx, pair, pct_from_ath
+            )
             continue
 
         icon_mult = ICON_MULTIPLIERS[icon]
@@ -315,10 +326,10 @@ def choose_order_from_rows(rows, buying_power: float):
         notional = base_alloc * icon_mult * ma_price_factor * sentiment_mult
 
         logging.info(
-            "Row %s %s: price=%.5f pct_down=%.2f bracket_pct=%.3f "
+            "Row %s %s: price=%.5f pct_from_ath=%.2f bracket_pct=%.3f "
             "icon=%s icon_mult=%.2f long_ma=%.5f ma_price_factor=%.3f "
             "base_alloc=%.2f notional_raw=%.2f",
-            idx, pair, price, pct_down, bracket_pct,
+            idx, pair, price, pct_from_ath, bracket_pct,
             icon, icon_mult, long_ma, ma_price_factor,
             base_alloc, notional
         )
