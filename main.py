@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import requests
 import gspread
@@ -223,29 +223,37 @@ def get_buying_power_from_summary(summary: dict) -> float:
     sys.exit(1)
 
 
-def any_open_positions(positions: list) -> bool:
+def get_open_instruments(positions: list) -> set:
     """
-    Return True if there is any open position in the account.
-    This enforces the rule:
-      - it should make only one active buy,
-      - send no more buys if an asset is active in the account.
+    Return a set of instrument names that currently have non-zero long or short units.
+    Used to skip candidates we already hold.
     """
-    if not positions:
-        return False
-
-    # A position is "active" if any long or short units != 0
+    instruments = set()
     for pos in positions:
+        instrument = pos.get("instrument")
         long_units = pos.get("long", {}).get("units", "0")
         short_units = pos.get("short", {}).get("units", "0")
         try:
-            if float(long_units) != 0 or float(short_units) != 0:
-                return True
-        except ValueError:
-            continue
-    return False
+            long_units_f = float(long_units)
+        except (ValueError, TypeError):
+            long_units_f = 0.0
+        try:
+            short_units_f = float(short_units)
+        except (ValueError, TypeError):
+            short_units_f = 0.0
+
+        if (long_units_f != 0 or short_units_f != 0) and instrument:
+            instruments.add(instrument)
+
+    logging.info("Currently open instruments: %s", ", ".join(sorted(instruments)) or "none")
+    return instruments
 
 
-def choose_order_from_rows(rows, buying_power: float):
+def choose_orders_from_rows(
+    rows,
+    buying_power: float,
+    open_instruments: set,
+) -> List[Tuple[str, float, float]]:
     """
     Scan rows and compute notional for valid candidates.
 
@@ -254,14 +262,17 @@ def choose_order_from_rows(rows, buying_power: float):
     - Only consider rows where:
         * icon in ICON_MULTIPLIERS
         * sentiment == 🟢
+    - Skip if the pair is already held in the account (in open_instruments).
     - % from ATH (C) is expected negative when below ATH:
         * we use its absolute value as "% down" to control bracket.
     - Icon multiplier scales inside the bracket.
     - Long MA vs price factor = long_ma / price
     - Anything with pct_from_ath > 0 (above ATH) is skipped.
     - If notional < 1.0, skip.
-    - Returns first valid (pair, price, notional) encountered.
+    - Returns a list of (pair, price, notional) for all valid candidates.
     """
+    candidates: List[Tuple[str, float, float]] = []
+
     for idx, row in enumerate(rows, start=2):  # start=2 because of header row
         # Guard against short rows
         if len(row) <= max(COL_PAIR, COL_PRICE, COL_PCT_DOWN,
@@ -278,6 +289,10 @@ def choose_order_from_rows(rows, buying_power: float):
 
         # Skip empty or header-ish rows
         if not pair or pair.lower() == "pair":
+            continue
+
+        if pair in open_instruments:
+            logging.info("Row %s %s: already held in account, skipping.", idx, pair)
             continue
 
         if sentiment != SENTIMENT_BUY:
@@ -338,7 +353,7 @@ def choose_order_from_rows(rows, buying_power: float):
             logging.info("Row %s %s: notional < 1.0 (%.2f), skipping.", idx, pair, notional)
             continue
 
-        # Don't exceed current buying power
+        # Don't exceed current buying power per candidate
         if notional > buying_power:
             logging.info(
                 "Row %s %s: notional %.2f exceeds buying power %.2f, clamping.",
@@ -353,14 +368,14 @@ def choose_order_from_rows(rows, buying_power: float):
             continue
 
         logging.info(
-            "Selected candidate: row %s %s, price=%.5f, notional=%.2f",
+            "Candidate accepted: row %s %s, price=%.5f, notional=%.2f",
             idx, pair, price, notional
         )
 
-        return pair, price, notional
+        candidates.append((pair, price, notional))
 
-    logging.info("No valid candidates found in sheet.")
-    return None
+    logging.info("Total valid candidates this run: %d", len(candidates))
+    return candidates
 
 
 def main():
@@ -378,13 +393,7 @@ def main():
 
     summary = oanda.get_account_summary()
     positions = oanda.get_open_positions()
-
-    if any_open_positions(positions):
-        logging.info(
-            "Account already has active positions; per rules, "
-            "no new buys will be placed this run."
-        )
-        return
+    open_instruments = get_open_instruments(positions)
 
     buying_power = get_buying_power_from_summary(summary)
     if buying_power <= 0:
@@ -399,41 +408,36 @@ def main():
         logging.info("No screener rows to process.")
         return
 
-    candidate = choose_order_from_rows(rows, buying_power)
-    if not candidate:
-        logging.info("No candidate met all criteria; ending run.")
+    candidates = choose_orders_from_rows(rows, buying_power, open_instruments)
+    if not candidates:
+        logging.info("No candidates met all criteria; ending run.")
         return
 
-    pair, price, notional = candidate
-
     # -----------------------------------------------------------------
-    # Convert notional to units and place order
+    # Place orders for all candidates not already held
     # -----------------------------------------------------------------
-    # NOTE:
-    #   This assumes the sheet price is in account currency per 1 unit of the
-    #   base instrument, similar to how Oanda quotes. If your sheet format
-    #   differs, adjust this conversion.
-    units = int(notional / price)
+    for pair, price, notional in candidates:
+        units = int(notional / price)
 
-    if units <= 0:
-        logging.info(
-            "Calculated units <= 0 for pair %s (price=%.5f, notional=%.2f), "
-            "no order will be placed.",
-            pair, price, notional,
-        )
-        return
+        if units <= 0:
+            logging.info(
+                "Calculated units <= 0 for pair %s (price=%.5f, notional=%.2f), "
+                "no order will be placed.",
+                pair, price, notional,
+            )
+            continue
 
-    try:
-        logging.info(
-            "Placing market buy on %s: notional=%.2f, price=%.5f, units=%s",
-            pair, notional, price, units
-        )
-        resp = oanda.create_market_buy(pair, units)
-        logging.info("Order placed successfully: %s", json.dumps(resp, indent=2))
-    except Exception as e:
-        logging.exception("Failed to place order: %s", e)
-        # Let process exit non-zero so you can see it in Railway logs
-        sys.exit(1)
+        try:
+            logging.info(
+                "Placing market buy on %s: notional=%.2f, price=%.5f, units=%s",
+                pair, notional, price, units
+            )
+            resp = oanda.create_market_buy(pair, units)
+            logging.info("Order placed successfully for %s: %s", pair, json.dumps(resp, indent=2))
+        except Exception as e:
+            logging.exception("Failed to place order for %s: %s", pair, e)
+            # Continue to next candidate rather than exiting entire run
+            continue
 
     logging.info("Run complete. Exiting.")
 
