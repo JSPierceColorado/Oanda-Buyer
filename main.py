@@ -25,10 +25,24 @@ COL_PAIR = 0        # A – Pair
 COL_PRICE = 1       # B – Price
 COL_PCT_DOWN = 2    # C – % down from ATH (stored as negative when below ATH)
 COL_LONG_MA = 10    # K – Long MA
-COL_ICON = 18       # S – Icon
-COL_SENTIMENT = 20  # U – Sentiment
+COL_ICON = 18       # S – Bullish icon
+COL_SENTIMENT = 20  # U – Bullish sentiment
+
+# Bearish sentiment + icon columns
+COL_BEAR_SENTIMENT = 13  # N – Bearish sentiment
+COL_BEAR_ICON = 22       # W – Bearish icon
 
 SENTIMENT_BUY = "🟢"
+SENTIMENT_SELL = "🔴"
+
+# Bearish icon multipliers
+BEAR_ICON_MULTIPLIERS = {
+    "📉": 2.5,
+    "🧊": 1.0,
+    "🧨": 2.0,
+    "🌋": 1.0,
+    "💣": 2.0,
+}
 
 # Defaults for Google Sheets
 DEFAULT_SHEET_NAME = "Active-Investing"
@@ -41,7 +55,7 @@ DEFAULT_WORKSHEET_NAME = "Oanda-Screener"
 
 def get_bracket_pct(pct_from_ath: float) -> Optional[float]:
     """
-    Bracket order size by % down from ATH.
+    Bullish bracket order size by % down from ATH.
 
     Sheet convention:
       - Negative values = below ATH (e.g. -10 means 10% down from ATH)
@@ -70,6 +84,38 @@ def get_bracket_pct(pct_from_ath: float) -> Optional[float]:
         return 0.15
     if pct_down > 18:
         return 0.20
+
+    return None
+
+
+def get_bearish_bracket_pct(pct_from_ath: float) -> Optional[float]:
+    """
+    Bearish bracket order size by % down from ATH.
+
+    Sheet convention:
+      - Negative values = below ATH (e.g. -10 means 10% down from ATH)
+      - Positive values = above ATH (treated as invalid here as well).
+
+    Bearish brackets:
+      0–6% down  -> 20% of buying power
+      7–12%      -> 15% of buying power
+      13–18%     -> 10% of buying power
+      19%+       -> 5% of buying power
+    """
+
+    if pct_from_ath > 0:
+        return None
+
+    pct_down = abs(pct_from_ath)
+
+    if 0 <= pct_down <= 6:
+        return 0.20
+    if 6 < pct_down <= 12:
+        return 0.15
+    if 12 < pct_down <= 18:
+        return 0.10
+    if pct_down > 18:
+        return 0.05
 
     return None
 
@@ -132,21 +178,27 @@ class OandaClient:
         data = self._request("GET", f"/v3/accounts/{self.account_id}/openPositions")
         return data.get("positions", [])
 
-    def create_market_buy(self, instrument: str, units: int) -> dict:
-        if units <= 0:
-            raise ValueError("Units must be positive for a buy order.")
+    def create_market_order(self, instrument: str, units: int) -> dict:
+        """
+        Create a market order.
+
+        Positive units  = buy / long
+        Negative units  = sell / short
+        """
+        if units == 0:
+            raise ValueError("Units must be non-zero for an order.")
 
         body = {
             "order": {
                 "instrument": instrument,
-                "units": str(units),  # positive = buy, negative = sell
+                "units": str(units),  # positive = buy (long), negative = sell (short)
                 "timeInForce": "FOK",
                 "type": "MARKET",
                 "positionFill": "DEFAULT",
             }
         }
 
-        logging.info("Submitting market buy: instrument=%s units=%s",
+        logging.info("Submitting market order: instrument=%s units=%s",
                      instrument, units)
         return self._request(
             "POST",
@@ -253,30 +305,46 @@ def choose_orders_from_rows(
     rows,
     buying_power: float,
     open_instruments: set,
-) -> List[Tuple[str, float, float]]:
+) -> List[Tuple[str, float, float, str]]:
     """
     Scan rows and compute notional for valid candidates.
 
-    Rules:
+    Bullish (long) side:
+      - Column S icon in ICON_MULTIPLIERS
+      - Column U sentiment == 🟢
+      - Bracket via get_bracket_pct (bigger further below ATH)
+      - MA factor = long_ma / price (bigger when price < MA)
+      - side = "long"
 
-    - Only consider rows where:
-        * icon in ICON_MULTIPLIERS
-        * sentiment == 🟢
-    - Skip if the pair is already held in the account (in open_instruments).
-    - % from ATH (C) is expected negative when below ATH:
-        * we use its absolute value as "% down" to control bracket.
-    - Icon multiplier scales inside the bracket.
-    - Long MA vs price factor = long_ma / price
-    - Anything with pct_from_ath > 0 (above ATH) is skipped.
-    - If notional < 1.0, skip.
-    - Returns a list of (pair, price, notional) for all valid candidates.
+    Bearish (short) side:
+      - Column W icon in BEAR_ICON_MULTIPLIERS
+      - Column N sentiment == 🔴
+      - Bracket via get_bearish_bracket_pct (bigger near ATH, smaller far below)
+      - MA factor = price / long_ma (bigger when price > MA)
+      - side = "short"
+
+    Shared rules:
+      - Skip if the pair is already held in the account (open_instruments).
+      - pct_from_ath must be <= 0 (below ATH); above ATH is skipped.
+      - If notional < 1.0, skip.
+      - Notional is clamped to buying_power.
+      - Avoid duplicate candidates for the same pair within a single run.
     """
-    candidates: List[Tuple[str, float, float]] = []
+    candidates: List[Tuple[str, float, float, str]] = []
+    used_pairs = set()
 
     for idx, row in enumerate(rows, start=2):  # start=2 because of header row
-        # Guard against short rows
-        if len(row) <= max(COL_PAIR, COL_PRICE, COL_PCT_DOWN,
-                           COL_LONG_MA, COL_ICON, COL_SENTIMENT):
+        # Guard against short rows (including bearish columns)
+        if len(row) <= max(
+            COL_PAIR,
+            COL_PRICE,
+            COL_PCT_DOWN,
+            COL_LONG_MA,
+            COL_ICON,
+            COL_SENTIMENT,
+            COL_BEAR_ICON,
+            COL_BEAR_SENTIMENT,
+        ):
             logging.debug("Row %s too short, skipping: %s", idx, row)
             continue
 
@@ -284,8 +352,12 @@ def choose_orders_from_rows(
         price_str = row[COL_PRICE]
         pct_from_ath_str = row[COL_PCT_DOWN]
         long_ma_str = row[COL_LONG_MA]
-        icon = row[COL_ICON].strip()
-        sentiment = row[COL_SENTIMENT].strip()
+
+        icon_bull = row[COL_ICON].strip()
+        sentiment_bull = row[COL_SENTIMENT].strip()
+
+        icon_bear = row[COL_BEAR_ICON].strip()
+        sentiment_bear = row[COL_BEAR_SENTIMENT].strip()
 
         # Skip empty or header-ish rows
         if not pair or pair.lower() == "pair":
@@ -293,16 +365,6 @@ def choose_orders_from_rows(
 
         if pair in open_instruments:
             logging.info("Row %s %s: already held in account, skipping.", idx, pair)
-            continue
-
-        if sentiment != SENTIMENT_BUY:
-            logging.debug("Row %s %s: sentiment not 🟢 (%s), skipping.",
-                          idx, pair, sentiment)
-            continue
-
-        if icon not in ICON_MULTIPLIERS:
-            logging.debug("Row %s %s: icon %s not in ICON_MULTIPLIERS, skipping.",
-                          idx, pair, icon)
             continue
 
         price = parse_float(price_str)
@@ -324,55 +386,130 @@ def choose_orders_from_rows(
                           idx, pair, pct_from_ath_str)
             continue
 
-        bracket_pct = get_bracket_pct(pct_from_ath)
-        if bracket_pct is None:
+        # -------------------------------------------------------------
+        # Bullish (long) logic
+        # -------------------------------------------------------------
+        if sentiment_bull == SENTIMENT_BUY and icon_bull in ICON_MULTIPLIERS:
+            bracket_pct = get_bracket_pct(pct_from_ath)
+            if bracket_pct is not None:
+                icon_mult = ICON_MULTIPLIERS[icon_bull]
+                ma_price_factor = long_ma / price  # larger when price < MA
+
+                base_alloc = buying_power * bracket_pct
+                notional = base_alloc * icon_mult * ma_price_factor
+
+                logging.info(
+                    "Row %s %s (bullish long): price=%.5f pct_from_ath=%.2f "
+                    "bracket_pct=%.3f icon=%s icon_mult=%.2f long_ma=%.5f "
+                    "ma_price_factor=%.3f base_alloc=%.2f notional_raw=%.2f",
+                    idx, pair, price, pct_from_ath, bracket_pct,
+                    icon_bull, icon_mult, long_ma, ma_price_factor,
+                    base_alloc, notional
+                )
+
+                if notional >= 1.0:
+                    if notional > buying_power:
+                        logging.info(
+                            "Row %s %s (bullish): notional %.2f exceeds buying power %.2f, clamping.",
+                            idx, pair, notional, buying_power
+                        )
+                        notional = buying_power
+
+                    notional = round(notional, 2)
+
+                    if notional >= 1.0:
+                        if pair in used_pairs:
+                            logging.info(
+                                "Row %s %s: already selected as candidate this run, "
+                                "skipping duplicate (bullish).",
+                                idx, pair
+                            )
+                        else:
+                            logging.info(
+                                "Candidate accepted (bullish long): row %s %s, price=%.5f, notional=%.2f",
+                                idx, pair, price, notional
+                            )
+                            candidates.append((pair, price, notional, "long"))
+                            used_pairs.add(pair)
+                else:
+                    logging.info(
+                        "Row %s %s (bullish): notional < 1.0 (%.2f), skipping.",
+                        idx, pair, notional
+                    )
+            else:
+                logging.debug(
+                    "Row %s %s (bullish): pct_from_ath %s outside valid brackets "
+                    "(likely above ATH), skipping.",
+                    idx, pair, pct_from_ath
+                )
+        else:
             logging.debug(
-                "Row %s %s: pct_from_ath %s outside valid brackets (likely above ATH), skipping.",
-                idx, pair, pct_from_ath
+                "Row %s %s: bullish conditions not met (sentiment=%r, icon=%r).",
+                idx, pair, sentiment_bull, icon_bull
             )
-            continue
 
-        icon_mult = ICON_MULTIPLIERS[icon]
-        ma_price_factor = long_ma / price
+        # -------------------------------------------------------------
+        # Bearish (short) logic
+        # -------------------------------------------------------------
+        if sentiment_bear == SENTIMENT_SELL and icon_bear in BEAR_ICON_MULTIPLIERS:
+            bracket_pct_bear = get_bearish_bracket_pct(pct_from_ath)
+            if bracket_pct_bear is not None:
+                icon_mult_bear = BEAR_ICON_MULTIPLIERS[icon_bear]
+                # Opposite of bullish: larger when price is ABOVE the long MA
+                ma_price_factor_bear = price / long_ma
 
-        sentiment_mult = 1.0  # we only reach here on 🟢
+                base_alloc_bear = buying_power * bracket_pct_bear
+                notional_bear = base_alloc_bear * icon_mult_bear * ma_price_factor_bear
 
-        base_alloc = buying_power * bracket_pct
-        notional = base_alloc * icon_mult * ma_price_factor * sentiment_mult
+                logging.info(
+                    "Row %s %s (bearish short): price=%.5f pct_from_ath=%.2f "
+                    "bracket_pct=%.3f icon=%s icon_mult=%.2f long_ma=%.5f "
+                    "ma_price_factor=%.3f base_alloc=%.2f notional_raw=%.2f",
+                    idx, pair, price, pct_from_ath, bracket_pct_bear,
+                    icon_bear, icon_mult_bear, long_ma, ma_price_factor_bear,
+                    base_alloc_bear, notional_bear
+                )
 
-        logging.info(
-            "Row %s %s: price=%.5f pct_from_ath=%.2f bracket_pct=%.3f "
-            "icon=%s icon_mult=%.2f long_ma=%.5f ma_price_factor=%.3f "
-            "base_alloc=%.2f notional_raw=%.2f",
-            idx, pair, price, pct_from_ath, bracket_pct,
-            icon, icon_mult, long_ma, ma_price_factor,
-            base_alloc, notional
-        )
+                if notional_bear >= 1.0:
+                    if notional_bear > buying_power:
+                        logging.info(
+                            "Row %s %s (bearish): notional %.2f exceeds buying power %.2f, clamping.",
+                            idx, pair, notional_bear, buying_power
+                        )
+                        notional_bear = buying_power
 
-        if notional < 1.0:
-            logging.info("Row %s %s: notional < 1.0 (%.2f), skipping.", idx, pair, notional)
-            continue
+                    notional_bear = round(notional_bear, 2)
 
-        # Don't exceed current buying power per candidate
-        if notional > buying_power:
-            logging.info(
-                "Row %s %s: notional %.2f exceeds buying power %.2f, clamping.",
-                idx, pair, notional, buying_power
+                    if notional_bear >= 1.0:
+                        if pair in used_pairs:
+                            logging.info(
+                                "Row %s %s: already selected as candidate this run, "
+                                "skipping duplicate (bearish).",
+                                idx, pair
+                            )
+                        else:
+                            logging.info(
+                                "Candidate accepted (bearish short): row %s %s, price=%.5f, notional=%.2f",
+                                idx, pair, price, notional_bear
+                            )
+                            candidates.append((pair, price, notional_bear, "short"))
+                            used_pairs.add(pair)
+                else:
+                    logging.info(
+                        "Row %s %s (bearish): notional < 1.0 (%.2f), skipping.",
+                        idx, pair, notional_bear
+                    )
+            else:
+                logging.debug(
+                    "Row %s %s (bearish): pct_from_ath %s outside valid brackets "
+                    "(likely above ATH), skipping.",
+                    idx, pair, pct_from_ath
+                )
+        else:
+            logging.debug(
+                "Row %s %s: bearish conditions not met (sentiment=%r, icon=%r).",
+                idx, pair, sentiment_bear, icon_bear
             )
-            notional = buying_power
-
-        notional = round(notional, 2)
-
-        if notional < 1.0:
-            logging.info("Row %s %s: notional fell below 1.0 after clamping, skipping.", idx, pair)
-            continue
-
-        logging.info(
-            "Candidate accepted: row %s %s, price=%.5f, notional=%.2f",
-            idx, pair, price, notional
-        )
-
-        candidates.append((pair, price, notional))
 
     logging.info("Total valid candidates this run: %d", len(candidates))
     return candidates
@@ -384,7 +521,7 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    logging.info("Starting Oanda buying bot run (single pass).")
+    logging.info("Starting Oanda trading bot run (single pass).")
 
     # -----------------------------------------------------------------
     # Oanda: summary & open positions
@@ -416,23 +553,28 @@ def main():
     # -----------------------------------------------------------------
     # Place orders for all candidates not already held
     # -----------------------------------------------------------------
-    for pair, price, notional in candidates:
+    for pair, price, notional, side in candidates:
         units = int(notional / price)
 
         if units <= 0:
             logging.info(
-                "Calculated units <= 0 for pair %s (price=%.5f, notional=%.2f), "
+                "Calculated units <= 0 for pair %s (price=%.5f, notional=%.2f, side=%s), "
                 "no order will be placed.",
-                pair, price, notional,
+                pair, price, notional, side,
             )
             continue
 
+        # Bullish = long (positive units), Bearish = short (negative units)
+        if side == "short":
+            units = -units
+
         try:
             logging.info(
-                "Placing market buy on %s: notional=%.2f, price=%.5f, units=%s",
+                "Placing market %s on %s: notional=%.2f, price=%.5f, units=%s",
+                "buy/long" if units > 0 else "sell/short",
                 pair, notional, price, units
             )
-            resp = oanda.create_market_buy(pair, units)
+            resp = oanda.create_market_order(pair, units)
             logging.info("Order placed successfully for %s: %s", pair, json.dumps(resp, indent=2))
         except Exception as e:
             logging.exception("Failed to place order for %s: %s", pair, e)
