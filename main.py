@@ -26,11 +26,12 @@ COL_PRICE = 1       # B – Price
 COL_PCT_DOWN = 2    # C – % down from ATH (stored as negative when below ATH)
 COL_LONG_MA = 10    # K – Long MA
 COL_ICON = 18       # S – Bullish icon
-COL_SENTIMENT = 20  # U – Bullish sentiment
+COL_SENTIMENT = 20  # U – Sentiment (🟢 / 🔴 / ⚪ / ➖)
 
 # Bearish sentiment + icon columns
-COL_BEAR_SENTIMENT = 13  # N – Bearish sentiment
-COL_BEAR_ICON = 22       # W – Bearish icon
+# NOTE: sentiment is in the SAME column (U) as bullish, just different emoji
+COL_BEAR_SENTIMENT = COL_SENTIMENT  # uses 🔴 in column U
+COL_BEAR_ICON = 22                  # W – Bearish icon
 
 SENTIMENT_BUY = "🟢"
 SENTIMENT_SELL = "🔴"
@@ -318,7 +319,7 @@ def choose_orders_from_rows(
 
     Bearish (short) side:
       - Column W icon in BEAR_ICON_MULTIPLIERS
-      - Column N sentiment == 🔴
+      - Column U sentiment == 🔴
       - Bracket via get_bearish_bracket_pct (bigger near ATH, smaller far below)
       - MA factor = price / long_ma (bigger when price > MA)
       - side = "short"
